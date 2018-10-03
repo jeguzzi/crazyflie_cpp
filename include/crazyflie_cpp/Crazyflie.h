@@ -38,7 +38,7 @@ public:
   };
 
   struct ParamTocEntry {
-    uint16_t id;
+    uint8_t id;
     ParamType type;
     bool readonly;
     // ParamLength length;
@@ -92,7 +92,7 @@ public:
   };
 
   struct MemoryTocEntry {
-    uint16_t id;
+    uint8_t id;
     MemoryType type;
     uint32_t size;
     uint64_t addr;
@@ -302,18 +302,15 @@ private:
   void sendPacket(
     const uint8_t* data,
     uint32_t length,
-    Crazyradio::Ack& result,
-    bool useSafeLink = true);
+    Crazyradio::Ack& result);
 
   bool sendPacket(
     const uint8_t* data,
-    uint32_t length,
-    bool useSafeLink = true);
+    uint32_t length);
 
  void sendPacketOrTimeout(
    const uint8_t* data,
    uint32_t length,
-   bool useSafeLink = true,
    float timeout = 1.0);
 
   void handleAck(
@@ -347,8 +344,8 @@ private:
   }
 
   void handleRequests(
+    bool throw_timeout = true,
     bool crtpMode = true,
-    bool useSafeLink = true,
     float baseTime = 2.0,
     float timePerRequest = 0.2);
 
@@ -455,12 +452,6 @@ private:
   std::vector<batchRequest> m_batchRequests;
   size_t m_numRequestsFinished;
 
-  int m_curr_up;
-  int m_curr_down;
-
-  bool m_log_use_V2;
-  bool m_param_use_V2;
-
   // logging
   Logger& m_logger;
 };
@@ -478,68 +469,38 @@ public:
     , m_id(0)
   {
     m_id = m_cf->registerLogBlock([=](crtpLogDataResponse* r, uint8_t s) { this->handleData(r, s);});
-    if (m_cf->m_log_use_V2) {
-      crtpLogCreateBlockV2Request request;
-      request.id = m_id;
-      int i = 0;
-      for (auto&& pair : variables) {
-        const Crazyflie::LogTocEntry* entry = m_cf->getLogTocEntry(pair.first, pair.second);
-        if (entry) {
-          request.items[i].logType = entry->type;
-          request.items[i].id = entry->id;
-          ++i;
-        }
-        else {
-          std::stringstream sstr;
-          sstr << "Could not find " << pair.first << "." << pair.second << " in log toc!";
-          throw std::runtime_error(sstr.str());
-        }
+    crtpLogCreateBlockRequest request;
+    request.id = m_id;
+    int i = 0;
+    for (auto&& pair : variables) {
+      const Crazyflie::LogTocEntry* entry = m_cf->getLogTocEntry(pair.first, pair.second);
+      if (entry) {
+        request.items[i].logType = entry->type;
+        request.items[i].id = entry->id;
+        ++i;
       }
-
-      m_cf->startBatchRequest();
-      m_cf->addRequest(reinterpret_cast<const uint8_t*>(&request), 3 + 3*i, 2);
-      m_cf->handleRequests();
-      auto r = m_cf->getRequestResult<crtpLogControlResponse>(0);
-      if (r->result != crtpLogControlResultOk
-          && r->result != crtpLogControlResultBlockExists) {
+      else {
         std::stringstream sstr;
-        sstr << "Could not create log block! Result: " << (int)r->result << " " << (int)m_id << " " << (int)r->requestByte1 << " " << (int)r->command;
+        sstr << "Could not find " << pair.first << "." << pair.second << " in log toc!";
         throw std::runtime_error(sstr.str());
       }
-    } else {
-      crtpLogCreateBlockRequest request;
-      request.id = m_id;
-      int i = 0;
-      for (auto&& pair : variables) {
-        const Crazyflie::LogTocEntry* entry = m_cf->getLogTocEntry(pair.first, pair.second);
-        if (entry) {
-          request.items[i].logType = entry->type;
-          request.items[i].id = entry->id;
-          ++i;
-        }
-        else {
-          std::stringstream sstr;
-          sstr << "Could not find " << pair.first << "." << pair.second << " in log toc!";
-          throw std::runtime_error(sstr.str());
-        }
-      }
+    }
 
-      m_cf->startBatchRequest();
-      m_cf->addRequest(reinterpret_cast<const uint8_t*>(&request), 3 + 2*i, 2);
-      m_cf->handleRequests();
-      auto r = m_cf->getRequestResult<crtpLogControlResponse>(0);
-      if (r->result != crtpLogControlResultOk
-          && r->result != crtpLogControlResultBlockExists) {
-        std::stringstream sstr;
-        sstr << "Could not create log block! Result: " << (int)r->result << " " << (int)m_id << " " << (int)r->requestByte1 << " " << (int)r->command;
-        throw std::runtime_error(sstr.str());
-      }
+    m_cf->startBatchRequest();
+    m_cf->addRequest(reinterpret_cast<const uint8_t*>(&request), 3 + 2*i, 2);
+    m_cf->handleRequests();
+    auto r = m_cf->getRequestResult<crtpLogControlResponse>(0);
+    if (r->result != crtpLogControlResultOk
+        && r->result != crtpLogControlResultBlockExists) {
+      std::stringstream sstr;
+      sstr << "Could not create log block! Result: " << (int)r->result << " " << (int)m_id << " " << (int)r->requestByte1 << " " << (int)r->command;
+      throw std::runtime_error(sstr.str());
     }
   }
 
   ~LogBlock()
   {
-    stop();
+    stop(false);
     m_cf->unregisterLogBlock(m_id);
   }
 
@@ -552,12 +513,12 @@ public:
     m_cf->handleRequests();
   }
 
-  void stop()
+  void stop(bool throw_timeout=true)
   {
     crtpLogStopRequest request(m_id);
     m_cf->startBatchRequest();
     m_cf->addRequest(request, 2);
-    m_cf->handleRequests();
+    m_cf->handleRequests(throw_timeout, true, 0.2, 0.2);
   }
 
 private:
@@ -596,88 +557,48 @@ public:
     , m_id(0)
   {
     m_id = m_cf->registerLogBlock([=](crtpLogDataResponse* r, uint8_t s) { this->handleData(r, s);});
-    if (m_cf->m_log_use_V2) {
-      crtpLogCreateBlockV2Request request;
-      request.id = m_id;
-      int i = 0;
-      size_t s = 0;
-      for (auto&& var : variables) {
-        auto pos = var.find(".");
-        std::string first = var.substr(0, pos);
-        std::string second = var.substr(pos+1);
-        const Crazyflie::LogTocEntry* entry = m_cf->getLogTocEntry(first, second);
-        if (entry) {
-          s += Crazyflie::size(entry->type);
-          if (s > 26) {
-            std::stringstream sstr;
-            sstr << "Can't configure that many variables in a single log block!"
-                 << " Ignoring " << first << "." << second << std::endl;
-            throw std::runtime_error(sstr.str());
-          } else {
-            request.items[i].logType = entry->type;
-            request.items[i].id = entry->id;
-            ++i;
-            m_types.push_back(entry->type);
-          }
-        }
-        else {
+    crtpLogCreateBlockRequest request;
+    request.id = m_id;
+    int i = 0;
+    size_t s = 0;
+    for (auto&& var : variables) {
+      auto pos = var.find(".");
+      std::string first = var.substr(0, pos);
+      std::string second = var.substr(pos+1);
+      const Crazyflie::LogTocEntry* entry = m_cf->getLogTocEntry(first, second);
+      if (entry) {
+        s += Crazyflie::size(entry->type);
+        if (s > 26) {
           std::stringstream sstr;
-          sstr << "Could not find " << first << "." << second << " in log toc!";
+          sstr << "Can't configure that many variables in a single log block!"
+               << " Ignoring " << first << "." << second << std::endl;
           throw std::runtime_error(sstr.str());
+        } else {
+          request.items[i].logType = entry->type;
+          request.items[i].id = entry->id;
+          ++i;
+          m_types.push_back(entry->type);
         }
       }
-      m_cf->startBatchRequest();
-      m_cf->addRequest(reinterpret_cast<const uint8_t*>(&request), 3 + 3*i, 2);
-      m_cf->handleRequests();
-      auto r = m_cf->getRequestResult<crtpLogControlResponse>(0);
-      if (r->result != crtpLogControlResultOk
-          && r->result != crtpLogControlResultBlockExists) {
-        throw std::runtime_error("Could not create log block!");
+      else {
+        std::stringstream sstr;
+        sstr << "Could not find " << first << "." << second << " in log toc!";
+        throw std::runtime_error(sstr.str());
       }
-    } else {
-      crtpLogCreateBlockRequest request;
-      request.id = m_id;
-      int i = 0;
-      size_t s = 0;
-      for (auto&& var : variables) {
-        auto pos = var.find(".");
-        std::string first = var.substr(0, pos);
-        std::string second = var.substr(pos+1);
-        const Crazyflie::LogTocEntry* entry = m_cf->getLogTocEntry(first, second);
-        if (entry) {
-          s += Crazyflie::size(entry->type);
-          if (s > 26) {
-            std::stringstream sstr;
-            sstr << "Can't configure that many variables in a single log block!"
-                 << " Ignoring " << first << "." << second << std::endl;
-            throw std::runtime_error(sstr.str());
-          } else {
-            request.items[i].logType = entry->type;
-            request.items[i].id = entry->id;
-            ++i;
-            m_types.push_back(entry->type);
-          }
-        }
-        else {
-          std::stringstream sstr;
-          sstr << "Could not find " << first << "." << second << " in log toc!";
-          throw std::runtime_error(sstr.str());
-        }
-      }
-      m_cf->startBatchRequest();
-      m_cf->addRequest(reinterpret_cast<const uint8_t*>(&request), 3 + 2*i, 2);
-      m_cf->handleRequests();
-      auto r = m_cf->getRequestResult<crtpLogControlResponse>(0);
-      if (r->result != crtpLogControlResultOk
-          && r->result != crtpLogControlResultBlockExists) {
-        throw std::runtime_error("Could not create log block!");
-      }
+    }
+    m_cf->startBatchRequest();
+    m_cf->addRequest(reinterpret_cast<const uint8_t*>(&request), 3 + 2*i, 2);
+    m_cf->handleRequests();
+    auto r = m_cf->getRequestResult<crtpLogControlResponse>(0);
+    if (r->result != crtpLogControlResultOk
+        && r->result != crtpLogControlResultBlockExists) {
+      throw std::runtime_error("Could not create log block!");
     }
   }
 
   ~LogBlockGeneric()
   {
-    stop();
+    stop(false);
     m_cf->unregisterLogBlock(m_id);
   }
 
@@ -690,12 +611,12 @@ public:
     m_cf->handleRequests();
   }
 
-  void stop()
+  void stop(bool throw_timeout=true)
   {
     crtpLogStopRequest request(m_id);
     m_cf->startBatchRequest();
     m_cf->addRequest(request, 2);
-    m_cf->handleRequests();
+    m_cf->handleRequests(throw_timeout);
   }
 
 private:
