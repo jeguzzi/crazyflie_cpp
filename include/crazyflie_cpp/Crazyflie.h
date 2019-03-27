@@ -106,7 +106,8 @@ public:
 public:
   Crazyflie(
     const std::string& link_uri,
-    Logger& logger = EmptyLogger);
+    Logger& logger = EmptyLogger,
+    int8_t crazyradio_tx_power = 0);
 
   void logReset();
 
@@ -424,6 +425,7 @@ private:
   uint8_t m_channel;
   uint64_t m_address;
   Crazyradio::Datarate m_datarate;
+  Crazyradio::Power m_power;
 
   std::vector<LogTocEntry> m_logTocEntries;
   std::map<uint8_t, std::function<void(crtpLogDataResponse*, uint8_t)> > m_logBlockCb;

@@ -62,6 +62,10 @@ public:
     void setPower(
         Power power);
 
+    Power getPower() const {
+        return m_power;
+    }
+
     void setArc(
         uint8_t arc);
 
@@ -99,5 +103,6 @@ private:
     uint8_t m_channel;
     uint64_t m_address;
     Datarate m_datarate;
+    Power m_power;
     bool m_ackEnable;
 };

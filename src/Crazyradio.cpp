@@ -26,6 +26,7 @@ Crazyradio::Crazyradio(
     , m_channel(0)
     , m_address(0)
     , m_datarate(Datarate_250KPS)
+    , m_power(Power_0DBM)
     , m_ackEnable(true)
 {
     open(devid);
@@ -90,6 +91,7 @@ void Crazyradio::setDatarate(Datarate datarate)
 void Crazyradio::setPower(Power power)
 {
     sendVendorSetup(SET_RADIO_POWER, power, 0, NULL, 0);
+    m_power = power;
 }
 
 void Crazyradio::setArc(uint8_t arc)

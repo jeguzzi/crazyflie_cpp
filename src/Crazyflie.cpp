@@ -29,7 +29,7 @@ Logger EmptyLogger;
 
 Crazyflie::Crazyflie(
   const std::string& link_uri,
-  Logger& logger)
+  Logger& logger, int8_t crazyradio_tx_power)
   : m_radio(nullptr)
   , m_transport(nullptr)
   , m_devId(0)
@@ -49,6 +49,14 @@ Crazyflie::Crazyflie(
   int channel;
   char datarateType;
   bool success = false;
+  if (crazyradio_tx_power < -12)
+    m_power = Crazyradio::Power_M18DBM;
+  else if (crazyradio_tx_power < -6)
+    m_power = Crazyradio::Power_M12DBM;
+  else if (crazyradio_tx_power < 0)
+    m_power = Crazyradio::Power_M6DBM;
+  else
+    m_power = Crazyradio::Power_0DBM;
 
   success = std::sscanf(link_uri.c_str(), "radio://%d/%d/%d%c/%" SCNx64,
      &m_devId, &channel, &datarate,
@@ -84,6 +92,7 @@ Crazyflie::Crazyflie(
         // g_crazyradios[m_devId]->setAckEnable(false);
         g_crazyradios[m_devId]->setAckEnable(true);
         g_crazyradios[m_devId]->setArc(0);
+        g_crazyradios[m_devId]->setPower(m_power);
       }
     }
 
@@ -818,6 +827,9 @@ void Crazyflie::sendPacket(
     }
     if (m_radio->getDatarate() != m_datarate) {
       m_radio->setDatarate(m_datarate);
+    }
+    if (m_radio->getPower() != m_power) {
+      m_radio->setPower(m_power);
     }
     if (!m_radio->getAckEnable()) {
       m_radio->setAckEnable(true);
