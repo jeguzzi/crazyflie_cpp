@@ -3,7 +3,8 @@
 
 #include "Crazyflie.h"
 #include "crtp.h"
-#include "bootloader.h"
+#include "crtpBootloader.h"
+#include "crtpNRF51.h"
 
 #include "Crazyradio.h"
 #include "CrazyflieUSB.h"
@@ -15,8 +16,9 @@
 #include <cmath>
 #include <inttypes.h>
 
-#define MAX_RADIOS 16
-#define MAX_USB     4
+const static int MAX_RADIOS = 16;
+const static int MAX_USB = 4;
+const static bool LOG_COMMUNICATION = 0;
 
 Crazyradio* g_crazyradios[MAX_RADIOS];
 std::mutex g_radioMutex[MAX_RADIOS];
@@ -29,7 +31,9 @@ Logger EmptyLogger;
 
 Crazyflie::Crazyflie(
   const std::string& link_uri,
-  Logger& logger, int8_t crazyradio_tx_power)
+  Logger& logger,
+  std::function<void(const char*)> consoleCb,
+  int8_t crazyradio_tx_power)
   : m_radio(nullptr)
   , m_transport(nullptr)
   , m_devId(0)
@@ -42,13 +46,16 @@ Crazyflie::Crazyflie(
   , m_paramValues()
   , m_emptyAckCallback(nullptr)
   , m_linkQualityCallback(nullptr)
-  , m_consoleCallback(nullptr)
+  , m_consoleCallback(consoleCb)
+  , m_log_use_V2(false)
+  , m_param_use_V2(false)
   , m_logger(logger)
 {
   int datarate;
   int channel;
   char datarateType;
   bool success = false;
+
   if (crazyradio_tx_power < -12)
     m_power = Crazyradio::Power_M18DBM;
   else if (crazyradio_tx_power < -6)
@@ -89,6 +96,7 @@ Crazyflie::Crazyflie(
       std::unique_lock<std::mutex> mlock(g_radioMutex[m_devId]);
       if (!g_crazyradios[m_devId]) {
         g_crazyradios[m_devId] = new Crazyradio(m_devId);
+        g_crazyradios[m_devId]->enableLogging(LOG_COMMUNICATION);
         // g_crazyradios[m_devId]->setAckEnable(false);
         g_crazyradios[m_devId]->setAckEnable(true);
         g_crazyradios[m_devId]->setArc(0);
@@ -110,6 +118,7 @@ Crazyflie::Crazyflie(
       std::unique_lock<std::mutex> mlock(g_crazyflieusbMutex[m_devId]);
       if (!g_crazyflieUSB[m_devId]) {
         g_crazyflieUSB[m_devId] = new CrazyflieUSB(m_devId);
+        g_crazyflieUSB[m_devId]->enableLogging(LOG_COMMUNICATION);
       }
     }
 
@@ -119,6 +128,45 @@ Crazyflie::Crazyflie(
   if (!success) {
     throw std::runtime_error("Uri is not valid!");
   }
+
+  // enable safelink
+  if (m_radio) {
+    crtpNrf51SetSafelinkRequest request(ENABLE_SAFELINK);
+    sendPacketOrTimeout(request, /*useSafeLink*/false);
+  }
+
+  m_curr_up = 0;
+  m_curr_down = 0;
+
+  m_protocolVersion = -1;
+
+}
+
+int Crazyflie::getProtocolVersion()
+{
+  crtpGetProtocolVersionRequest req;
+  startBatchRequest();
+  addRequest(req, 1);
+  handleRequests();
+  return getRequestResult<crtpGetProtocolVersionResponse>(0)->version;
+}
+
+std::string Crazyflie::getFirmwareVersion()
+{
+  crtpGetFirmwareVersionRequest req;
+  startBatchRequest();
+  addRequest(req, 1);
+  handleRequests();
+  return std::string(getRequestResult<crtpGetFirmwareVersionResponse>(0)->version);
+}
+
+std::string Crazyflie::getDeviceTypeName()
+{
+  crtpGetDeviceTypeNameRequest req;
+  startBatchRequest();
+  addRequest(req, 1);
+  handleRequests();
+  return std::string(getRequestResult<crtpGetDeviceTypeNameResponse>(0)->name);
 }
 
 void Crazyflie::logReset()
@@ -136,13 +184,25 @@ void Crazyflie::sendSetpoint(
   uint16_t thrust)
 {
   crtpSetpointRequest request(roll, pitch, yawrate, thrust);
-  sendPacket((const uint8_t*)&request, sizeof(request));
+  sendPacket(request);
 }
 
 void Crazyflie::sendStop()
 {
   crtpStopRequest request;
-  sendPacket((const uint8_t*)&request, sizeof(request));
+  sendPacket(request);
+}
+
+void Crazyflie::emergencyStop()
+{
+  crtpEmergencyStopRequest request;
+  sendPacketOrTimeout(request);
+}
+
+void Crazyflie::emergencyStopWatchdog()
+{
+  crtpEmergencyStopWatchdogRequest request;
+  sendPacketOrTimeout(request);
 }
 
 void Crazyflie::sendPositionSetpoint(
@@ -152,7 +212,7 @@ void Crazyflie::sendPositionSetpoint(
   float yaw)
 {
   crtpPositionSetpointRequest request(x, y, z, yaw);
-  sendPacket((const uint8_t*)&request, sizeof(request));
+  sendPacket(request);
 }
 
 void Crazyflie::sendHoverSetpoint(
@@ -162,7 +222,7 @@ void Crazyflie::sendHoverSetpoint(
   float zDistance)
 {
   crtpHoverSetpointRequest request(vx, vy, yawrate, zDistance);
-  sendPacket((const uint8_t*)&request, sizeof(request));
+  sendPacket(request);
 }
 
 void Crazyflie::sendFullStateSetpoint(
@@ -178,7 +238,21 @@ void Crazyflie::sendFullStateSetpoint(
     ax, ay, az,
     qx, qy, qz, qw,
     rollRate, pitchRate, yawRate);
-  sendPacket((const uint8_t*)&request, sizeof(request));
+  sendPacket(request);
+}
+
+void Crazyflie::sendVelocityWorldSetpoint(
+        float x, float y, float z, float yawRate)
+{
+  crtpVelocityWorldSetpointRequest request(
+    x, y, z, yawRate);
+  sendPacket(request);
+}
+
+void Crazyflie::notifySetpointsStop(uint32_t remainValidMillisecs)
+{
+  crtpNotifySetpointsStopRequest request(remainValidMillisecs);
+  sendPacketOrTimeout(request);
 }
 
 void Crazyflie::sendExternalPositionUpdate(
@@ -187,13 +261,21 @@ void Crazyflie::sendExternalPositionUpdate(
   float z)
 {
   crtpExternalPositionUpdate position(x, y, z);
-  sendPacket((const uint8_t*)&position, sizeof(position));
+  sendPacket(position);
+}
+
+void Crazyflie::sendExternalPoseUpdate(
+  float x, float y, float z,
+  float qx, float qy, float qz, float qw)
+{
+  crtpExternalPoseUpdate pose(x, y, z, qx, qy, qz, qw);
+  sendPacket(pose);
 }
 
 void Crazyflie::sendPing()
 {
-  uint8_t ping = 0xFF;
-  sendPacket(&ping, sizeof(ping));
+  crtpEmpty req;
+  sendPacket(req);
 }
 
 /**
@@ -206,7 +288,7 @@ void Crazyflie::transmitPackets()
     std::vector<crtpPacket_t>::iterator it;
     for (it = m_outgoing_packets.begin(); it != m_outgoing_packets.end(); it++)
     {
-      sendPacket(it->raw, it->size+1);
+      sendPacketInternal(it->raw, it->size+1);
     }
     m_outgoing_packets.clear();
   }
@@ -215,82 +297,89 @@ void Crazyflie::transmitPackets()
 // https://forum.bitcraze.io/viewtopic.php?f=9&t=1488
 void Crazyflie::reboot()
 {
-  const uint8_t reboot_init[] = {0xFF, 0xFE, 0xFF};
-  sendPacketOrTimeout(reboot_init, sizeof(reboot_init));
+  if (m_radio) {
+    crtpNrf51ResetInitRequest req1;
+    sendPacketOrTimeout(req1);
 
-  const uint8_t reboot_to_firmware[] = {0xFF, 0xFE, 0xF0, 0x01};
-  sendPacketOrTimeout(reboot_to_firmware, sizeof(reboot_to_firmware));
+    crtpNrf51ResetRequest req2(/*bootToFirmware*/ 1);
+    sendPacketOrTimeout(req2);
+  }
 }
 
 uint64_t Crazyflie::rebootToBootloader()
 {
-  bootloaderResetInitRequest req(TargetNRF51);
-  startBatchRequest();
-  addRequest(req, 3);
-  handleRequests(/*crtpMode=*/false);
-  const bootloaderResetInitResponse* response = getRequestResult<bootloaderResetInitResponse>(0);
+  if (m_radio) {
+    crtpNrf51ResetInitRequest req;
+    startBatchRequest();
+    addRequest(req, 2);
+    handleRequests();
+    const crtpNrf51ResetInitResponse* response = getRequestResult<crtpNrf51ResetInitResponse>(0);
 
-  uint64_t result =
-      ((uint64_t)response->addr[0] << 0)
-    | ((uint64_t)response->addr[1] << 8)
-    | ((uint64_t)response->addr[2] << 16)
-    | ((uint64_t)response->addr[3] << 24)
-    | ((uint64_t)0xb1 << 32);
+    uint64_t result =
+        ((uint64_t)response->addr[0] << 0)
+      | ((uint64_t)response->addr[1] << 8)
+      | ((uint64_t)response->addr[2] << 16)
+      | ((uint64_t)response->addr[3] << 24)
+      | ((uint64_t)0xb1 << 32);
 
-  const uint8_t reboot_to_bootloader[] = {0xFF, 0xFE, 0xF0, 0x00};
-  // for (size_t i = 0; i < 10; ++i) {
-  //   if (sendPacket(reboot_to_bootloader, sizeof(reboot_to_bootloader))) {
-  //     break;
-  //   }
-  // }
-  sendPacketOrTimeout(reboot_to_bootloader, sizeof(reboot_to_bootloader));
+    crtpNrf51ResetRequest req2(/*bootToFirmware*/ 0);
+    sendPacketOrTimeout(req2);
 
-  return result;
+    // switch to new address
+    m_address = result;
+    m_channel = 0;
+    m_datarate = Crazyradio::Datarate_2MPS;
+
+
+    return result;
+  } else {
+    return -1;
+  }
+}
+
+void Crazyflie::rebootFromBootloader()
+{
+  if (m_radio) {
+    bootloaderResetRequest req(/*bootToFirmware*/ 1);
+    sendPacketOrTimeout(req, /*useSafeLink*/ false);
+  }
 }
 
 void Crazyflie::sysoff()
 {
-  const uint8_t shutdown[] = {0xFF, 0xFE, 0x02};
-  sendPacketOrTimeout(shutdown, sizeof(shutdown));
-}
-
-void Crazyflie::trySysOff()
-{
-  const uint8_t shutdown[] = {0xFF, 0xFE, 0x02};
-  for (size_t i = 0; i < 10; ++i) {
-    if (sendPacket(shutdown, sizeof(shutdown))) {
-      break;
-    }
+  if (m_radio) {
+    crtpNrf51SysOffRequest req;
+    sendPacketOrTimeout(req);
   }
 }
 
 void Crazyflie::alloff()
 {
-  const uint8_t shutdown[] = {0xFF, 0xFE, 0x01};
-  sendPacketOrTimeout(shutdown, sizeof(shutdown));
+  if (m_radio) {
+    crtpNrf51AllOffRequest req;
+    sendPacketOrTimeout(req);
+  }
 }
 
 void Crazyflie::syson()
 {
-  const uint8_t shutdown[] = {0xFF, 0xFE, 0x03};
-  sendPacketOrTimeout(shutdown, sizeof(shutdown));
+  if (m_radio) {
+    crtpNrf51SysOnRequest req;
+    sendPacketOrTimeout(req);
+  }
 }
 
 float Crazyflie::vbat()
 {
-  struct nrf51vbatResponse
-  {
-    uint8_t dummy1;
-    uint8_t dummy2;
-    uint8_t dummy3;
-    float vbat;
-  } __attribute__((packed));
-
-  const uint8_t shutdown[] = {0xFF, 0xFE, 0x04};
-  startBatchRequest();
-  addRequest(shutdown, 2);
-  handleRequests();
-  return getRequestResult<nrf51vbatResponse>(0)->vbat;
+  if (m_radio) {
+    crtpNrf51GetVBatRequest req;
+    startBatchRequest();
+    addRequest(req, 2);
+    handleRequests();
+    return getRequestResult<crtpNrf51GetVBatResponse>(0)->vbat;
+  } else {
+    return nan("");
+  }
 }
 
 void Crazyflie::writeFlash(
@@ -301,17 +390,11 @@ void Crazyflie::writeFlash(
   bootloaderGetInfoRequest req(target);
   startBatchRequest();
   addRequest(req, 3);
-  handleRequests(/*crtpMode=*/false);
+  handleRequests(/*crtpMode=*/false, /*useSafeLink*/ false);
   const bootloaderGetInfoResponse* response = getRequestResult<bootloaderGetInfoResponse>(0);
   uint16_t pageSize = response->pageSize;
   uint16_t flashStart = response->flashStart;
   uint16_t nBuffPage = response->nBuffPage;
-  // std::cout << "pageSize: " << pageSize
-  //           << " nBuffPage: " << nBuffPage
-  //           << " nFlashPage: " << response->nFlashPage
-  //           << " flashStart: " << flashStart
-  //           << " version: " << (int)response->version
-  //           << std::endl;
 
   uint16_t numPages = ceil(data.size() / (float)pageSize);
   if (numPages + flashStart >= response->nFlashPage) {
@@ -319,14 +402,26 @@ void Crazyflie::writeFlash(
     sstr << "Requested size too large!";
     throw std::runtime_error(sstr.str());
   }
-  // std::cout << "numPages: " << numPages << std::endl;
+
+  std::stringstream sstr;
+  sstr << "pageSize: " << pageSize
+            << " nBuffPage: " << nBuffPage
+            << " nFlashPage: " << response->nFlashPage
+            << " flashStart: " << flashStart
+            << " version: " << (int)response->version
+            << " numPages: " << numPages;
+  m_logger.info(sstr.str());
 
   // write flash
   size_t offset = 0;
   uint16_t usedBuffers = 0;
   // startBatchRequest();
   for (uint16_t page = flashStart; page < numPages + flashStart; ++page) {
+    std::stringstream sstr;
+    sstr << "page: " << page - flashStart + 1 << " / " << numPages;
+    m_logger.info(sstr.str());
     for (uint16_t address = 0; address < pageSize; address += 25) {
+
       // std::cout << "request: " << page << " " << address << std::endl;
       bootloaderLoadBufferRequest req(target, usedBuffers, address);
       size_t requestedSize = std::min<size_t>(data.size() - offset, std::min<size_t>(25, pageSize - address));
@@ -336,9 +431,9 @@ void Crazyflie::writeFlash(
       // std::cout << "request: " << req.page << " " << req.address << " " << requestedSize << std::endl;
       // for (size_t i = 0; i < 10; ++i) {
 
-      auto start = std::chrono::system_clock::now();
+      // auto start = std::chrono::system_clock::now();
       // while (true) {
-        sendPacketOrTimeout((uint8_t*)&req, 7 + requestedSize);
+        sendPacketOrTimeoutInternal((uint8_t*)&req, 7 + requestedSize, false);
       //   startBatchRequest();
       //   bootloaderReadBufferRequest req2(target, usedBuffers, address);
       //   addRequest(req2, 7);
@@ -383,15 +478,15 @@ void Crazyflie::writeFlash(
 
       // write flash
       bootloaderWriteFlashRequest req(target, 0, page - usedBuffers + 1, usedBuffers);
-      sendPacketOrTimeout((uint8_t*)&req, sizeof(req));
+      sendPacketOrTimeoutInternal((uint8_t*)&req, sizeof(req), false);
 
       auto start = std::chrono::system_clock::now();
 
       size_t tries = 0;
       while (true) {
-        Crazyradio::Ack ack;
+        ITransport::Ack ack;
         bootloaderFlashStatusRequest statReq(target);
-        sendPacket((const uint8_t*)&statReq, sizeof(statReq), ack);
+        sendPacket(statReq, ack, false);
         if (   ack.ack
             && ack.size == 5
             && memcmp(&req, ack.data, 3) == 0) {
@@ -414,7 +509,7 @@ void Crazyflie::writeFlash(
         std::chrono::duration<double> elapsedSeconds = end-start;
         if (elapsedSeconds.count() > 0.5) {
           start = end;
-          sendPacketOrTimeout((uint8_t*)&req, sizeof(req));
+          sendPacketOrTimeout(req, false);
           ++tries;
           if (tries > 5) {
             throw std::runtime_error("timeout");
@@ -444,16 +539,10 @@ void Crazyflie::readFlash(
   bootloaderGetInfoRequest req(target);
   startBatchRequest();
   addRequest(req, 3);
-  handleRequests(/*crtpMode=*/false);
+  handleRequests(/*crtpMode=*/false, /*useSafelink*/false);
   const bootloaderGetInfoResponse* response = getRequestResult<bootloaderGetInfoResponse>(0);
   uint16_t pageSize = response->pageSize;
   uint16_t flashStart = response->flashStart;
-  // std::cout << "pageSize: " << pageSize
-  //           << " nBuffPage: " << response->nBuffPage
-  //           << " nFlashPage: " << response->nFlashPage
-  //           << " flashStart: " << flashStart
-  //           << " version: " << (int)response->version
-  //           << std::endl;
 
   uint16_t numPages = ceil(size / (float)pageSize);
   if (numPages + flashStart >= response->nFlashPage) {
@@ -461,7 +550,14 @@ void Crazyflie::readFlash(
     sstr << "Requested size too large!";
     throw std::runtime_error(sstr.str());
   }
-  // std::cout << "numPages: " << numPages << std::endl;
+
+  std::stringstream sstr;
+  sstr << "pageSize: " << pageSize
+       << " nFlashPage: " << response->nFlashPage
+       << " flashStart: " << flashStart
+       << " version: " << (int)response->version
+       << " numPages: " << numPages;
+  m_logger.info(sstr.str());
 
   // read flash
   size_t offset = 0;
@@ -478,7 +574,7 @@ void Crazyflie::readFlash(
       }
     }
   }
-  handleRequests(/*crtpMode=*/false);
+  handleRequests(/*crtpMode=*/false, /*useSafelink*/false);
 
   // update output
   data.resize(size);
@@ -498,21 +594,36 @@ void Crazyflie::readFlash(
   }
 }
 
-void Crazyflie::setChannel(uint8_t channel)
-{
-  const uint8_t setChannel[] = {0xFF, 0x03, 0x01, channel};
-  sendPacketOrTimeout(setChannel, sizeof(setChannel));
-}
-
 void Crazyflie::requestLogToc(bool forceNoCache)
 {
-  // Find the number of log variables in TOC
-  crtpLogGetInfoRequest infoRequest;
+  m_log_use_V2 = true;
+  uint16_t len;
+  uint32_t crc;
+
+  // Lazily initialize protocol version
+  if (m_protocolVersion < 0) {
+    m_protocolVersion = getProtocolVersion();
+  }
+
+  crtpLogGetInfoV2Request infoRequest;
   startBatchRequest();
   addRequest(infoRequest, 1);
-  handleRequests();
-  size_t len = getRequestResult<crtpLogGetInfoResponse>(0)->log_len;
-  uint32_t crc = getRequestResult<crtpLogGetInfoResponse>(0)->log_crc;
+  if (m_protocolVersion >= 4) {
+    handleRequests();
+    len = getRequestResult<crtpLogGetInfoV2Response>(0)->log_len;
+    crc = getRequestResult<crtpLogGetInfoV2Response>(0)->log_crc;
+  } else {
+    // std::cout << "Fall back to V1 param API" << std::endl;
+    m_log_use_V2 = false;
+
+    crtpLogGetInfoRequest infoRequest;
+    startBatchRequest();
+    addRequest(infoRequest, 1);
+    handleRequests();
+    len = getRequestResult<crtpLogGetInfoResponse>(0)->log_len;
+    crc = getRequestResult<crtpLogGetInfoResponse>(0)->log_crc;
+    // std::cout << len << std::endl;
+  }
 
   // check if it is in the cache
   std::string fileName = "log" + std::to_string(crc) + ".csv";
@@ -523,21 +634,39 @@ void Crazyflie::requestLogToc(bool forceNoCache)
 
     // Request detailed information
     startBatchRequest();
-    for (size_t i = 0; i < len; ++i) {
-      crtpLogGetItemRequest itemRequest(i);
-      addRequest(itemRequest, 2);
+    if (m_log_use_V2) {
+      for (size_t i = 0; i < len; ++i) {
+        crtpLogGetItemV2Request itemRequest(i);
+        addRequest(itemRequest, 2);
+      }
+    } else {
+      for (size_t i = 0; i < len; ++i) {
+        crtpLogGetItemRequest itemRequest(i);
+        addRequest(itemRequest, 2);
+      }
     }
     handleRequests();
 
     // Update internal structure with obtained data
     m_logTocEntries.resize(len);
-    for (size_t i = 0; i < len; ++i) {
-      auto response = getRequestResult<crtpLogGetItemResponse>(i);
-      LogTocEntry& entry = m_logTocEntries[i];
-      entry.id = i;
-      entry.type = (LogType)response->type;
-      entry.group = std::string(&response->text[0]);
-      entry.name = std::string(&response->text[entry.group.size() + 1]);
+    if (m_log_use_V2) {
+      for (size_t i = 0; i < len; ++i) {
+        auto response = getRequestResult<crtpLogGetItemV2Response>(i);
+        LogTocEntry& entry = m_logTocEntries[i];
+        entry.id = i;
+        entry.type = (LogType)response->type;
+        entry.group = std::string(&response->text[0]);
+        entry.name = std::string(&response->text[entry.group.size() + 1]);
+      }
+    } else {
+      for (size_t i = 0; i < len; ++i) {
+        auto response = getRequestResult<crtpLogGetItemResponse>(i);
+        LogTocEntry& entry = m_logTocEntries[i];
+        entry.id = i;
+        entry.type = (LogType)response->type;
+        entry.group = std::string(&response->text[0]);
+        entry.name = std::string(&response->text[entry.group.size() + 1]);
+      }
     }
 
     // Write a cache file
@@ -577,47 +706,96 @@ void Crazyflie::requestLogToc(bool forceNoCache)
 
 void Crazyflie::requestParamToc(bool forceNoCache)
 {
+  m_param_use_V2 = true;
+  uint16_t numParam;
+  uint32_t crc;
+
+  // Lazily initialize protocol version
+  if (m_protocolVersion < 0) {
+    m_protocolVersion = getProtocolVersion();
+  }
+
   // Find the number of parameters in TOC
-  crtpParamTocGetInfoRequest infoRequest;
+  crtpParamTocGetInfoV2Request infoRequest;
   startBatchRequest();
+  // std::cout << "infoReq" << std::endl;
   addRequest(infoRequest, 1);
-  handleRequests();
-  size_t len = getRequestResult<crtpParamTocGetInfoResponse>(0)->numParam;
-  uint32_t crc = getRequestResult<crtpParamTocGetInfoResponse>(0)->crc;
+  if (m_protocolVersion >= 4) {
+    handleRequests();
+    numParam = getRequestResult<crtpParamTocGetInfoV2Response>(0)->numParam;
+    crc = getRequestResult<crtpParamTocGetInfoV2Response>(0)->crc;
+  } else {
+    // std::cout << "Fall back to V1 param API" << std::endl;
+    m_param_use_V2 = false;
+
+    crtpParamTocGetInfoRequest infoRequest;
+    startBatchRequest();
+    addRequest(infoRequest, 1);
+    handleRequests();
+    numParam = getRequestResult<crtpParamTocGetInfoResponse>(0)->numParam;
+    crc = getRequestResult<crtpParamTocGetInfoResponse>(0)->crc;
+  }
 
   // check if it is in the cache
   std::string fileName = "params" + std::to_string(crc) + ".csv";
   std::ifstream infile(fileName);
 
   if (forceNoCache || !infile.good()) {
-    m_logger.info("Params: " + std::to_string(len));
+    m_logger.info("Params: " + std::to_string(numParam));
 
     // Request detailed information and values
     startBatchRequest();
-    for (size_t i = 0; i < len; ++i) {
-      crtpParamTocGetItemRequest itemRequest(i);
-      addRequest(itemRequest, 2);
-      crtpParamReadRequest readRequest(i);
-      addRequest(readRequest, 1);
+    if (!m_param_use_V2) {
+      for (uint16_t i = 0; i < numParam; ++i) {
+        crtpParamTocGetItemRequest itemRequest(i);
+        addRequest(itemRequest, 2);
+        crtpParamReadRequest readRequest(i);
+        addRequest(readRequest, 1);
+      }
+    } else {
+      for (uint16_t i = 0; i < numParam; ++i) {
+        crtpParamTocGetItemV2Request itemRequest(i);
+        addRequest(itemRequest, 2);
+        crtpParamReadV2Request readRequest(i);
+        addRequest(readRequest, 1);
+      }
     }
     handleRequests();
-
     // Update internal structure with obtained data
-    m_paramTocEntries.resize(len);
-    for (size_t i = 0; i < len; ++i) {
-      auto r = getRequestResult<crtpParamTocGetItemResponse>(i*2+0);
-      auto val = getRequestResult<crtpParamValueResponse>(i*2+1);
+    m_paramTocEntries.resize(numParam);
 
-      ParamTocEntry& entry = m_paramTocEntries[i];
-      entry.id = i;
-      entry.type = (ParamType)(r->length | r-> type << 2 | r->sign << 3);
-      entry.readonly = r->readonly;
-      entry.group = std::string(&r->text[0]);
-      entry.name = std::string(&r->text[entry.group.size() + 1]);
+    if (!m_param_use_V2) {
+      for (uint16_t i = 0; i < numParam; ++i) {
+        auto r = getRequestResult<crtpParamTocGetItemResponse>(i*2+0);
+        auto val = getRequestResult<crtpParamValueResponse>(i*2+1);
 
-      ParamValue v;
-      std::memcpy(&v, &val->valueFloat, 4);
-      m_paramValues[i] = v;
+        ParamTocEntry& entry = m_paramTocEntries[i];
+        entry.id = i;
+        entry.type = (ParamType)(r->length | r-> type << 2 | r->sign << 3);
+        entry.readonly = r->readonly;
+        entry.group = std::string(&r->text[0]);
+        entry.name = std::string(&r->text[entry.group.size() + 1]);
+
+        ParamValue v;
+        std::memcpy(&v, &val->valueFloat, 4);
+        m_paramValues[i] = v;
+      }
+    } else {
+      for (uint16_t i = 0; i < numParam; ++i) {
+        auto r = getRequestResult<crtpParamTocGetItemV2Response>(i*2+0);
+        auto val = getRequestResult<crtpParamValueV2Response>(i*2+1);
+
+        ParamTocEntry& entry = m_paramTocEntries[i];
+        entry.id = i;
+        entry.type = (ParamType)(r->length | r-> type << 2 | r->sign << 3);
+        entry.readonly = r->readonly;
+        entry.group = std::string(&r->text[0]);
+        entry.name = std::string(&r->text[entry.group.size() + 1]);
+
+        ParamValue v;
+        std::memcpy(&v, &val->valueFloat, 4);
+        m_paramValues[i] = v;
+      }
     }
 
     // Write a cache file
@@ -657,17 +835,32 @@ void Crazyflie::requestParamToc(bool forceNoCache)
     }
 
     // Request values
-    startBatchRequest();
-    for (size_t i = 0; i < len; ++i) {
-      crtpParamReadRequest readRequest(i);
-      addRequest(readRequest, 1);
-    }
-    handleRequests();
-    for (size_t i = 0; i < len; ++i) {
-      auto val = getRequestResult<crtpParamValueResponse>(i);
-      ParamValue v;
-      std::memcpy(&v, &val->valueFloat, 4);
-      m_paramValues[i] = v;
+    if (!m_param_use_V2) {
+      startBatchRequest();
+      for (size_t i = 0; i < numParam; ++i) {
+        crtpParamReadRequest readRequest(i);
+        addRequest(readRequest, 1);
+      }
+      handleRequests();
+      for (size_t i = 0; i < numParam; ++i) {
+        auto val = getRequestResult<crtpParamValueResponse>(i);
+        ParamValue v;
+        std::memcpy(&v, &val->valueFloat, 4);
+        m_paramValues[i] = v;
+      }
+    } else {
+      startBatchRequest();
+      for (size_t i = 0; i < numParam; ++i) {
+        crtpParamReadV2Request readRequest(i);
+        addRequest(readRequest, 1);
+      }
+      handleRequests();
+      for (size_t i = 0; i < numParam; ++i) {
+        auto val = getRequestResult<crtpParamValueV2Response>(i);
+        ParamValue v;
+        std::memcpy(&v, &val->valueFloat, 4);
+        m_paramValues[i] = v;
+      }
     }
   }
 }
@@ -709,55 +902,102 @@ void Crazyflie::startSetParamRequest()
   startBatchRequest();
 }
 
-void Crazyflie::addSetParam(uint8_t id, const ParamValue& value)
+void Crazyflie::addSetParam(uint16_t id, const ParamValue& value)
 {
   bool found = false;
   for (auto&& entry : m_paramTocEntries) {
     if (entry.id == id) {
       found = true;
-      switch (entry.type) {
-        case ParamTypeUint8:
-          {
-            crtpParamWriteRequest<uint8_t> request(id, value.valueUint8);
-            addRequest(request, 1);
-            break;
-          }
-        case ParamTypeInt8:
-          {
-            crtpParamWriteRequest<int8_t> request(id, value.valueInt8);
-            addRequest(request, 1);
-            break;
-          }
-        case ParamTypeUint16:
-          {
-            crtpParamWriteRequest<uint16_t> request(id, value.valueUint16);
-            addRequest(request, 1);
-            break;
-          }
-        case ParamTypeInt16:
-          {
-            crtpParamWriteRequest<int16_t> request(id, value.valueInt16);
-            addRequest(request, 1);
-            break;
-          }
-        case ParamTypeUint32:
-          {
-            crtpParamWriteRequest<uint32_t> request(id, value.valueUint32);
-            addRequest(request, 1);
-            break;
-          }
-        case ParamTypeInt32:
-          {
-            crtpParamWriteRequest<int32_t> request(id, value.valueInt32);
-            addRequest(request, 1);
-            break;
-          }
-        case ParamTypeFloat:
-          {
-            crtpParamWriteRequest<float> request(id, value.valueFloat);
-            addRequest(request, 1);
-            break;
-          }
+      if (!m_param_use_V2) {
+        switch (entry.type) {
+          case ParamTypeUint8:
+            {
+              crtpParamWriteRequest<uint8_t> request(id, value.valueUint8);
+              addRequest(request, 1);
+              break;
+            }
+          case ParamTypeInt8:
+            {
+              crtpParamWriteRequest<int8_t> request(id, value.valueInt8);
+              addRequest(request, 1);
+              break;
+            }
+          case ParamTypeUint16:
+            {
+              crtpParamWriteRequest<uint16_t> request(id, value.valueUint16);
+              addRequest(request, 1);
+              break;
+            }
+          case ParamTypeInt16:
+            {
+              crtpParamWriteRequest<int16_t> request(id, value.valueInt16);
+              addRequest(request, 1);
+              break;
+            }
+          case ParamTypeUint32:
+            {
+              crtpParamWriteRequest<uint32_t> request(id, value.valueUint32);
+              addRequest(request, 1);
+              break;
+            }
+          case ParamTypeInt32:
+            {
+              crtpParamWriteRequest<int32_t> request(id, value.valueInt32);
+              addRequest(request, 1);
+              break;
+            }
+          case ParamTypeFloat:
+            {
+              crtpParamWriteRequest<float> request(id, value.valueFloat);
+              addRequest(request, 1);
+              break;
+            }
+        }
+      } else {
+        switch (entry.type) {
+          case ParamTypeUint8:
+            {
+              crtpParamWriteV2Request<uint8_t> request(id, value.valueUint8);
+              addRequest(request, 2);
+              break;
+            }
+          case ParamTypeInt8:
+            {
+              crtpParamWriteV2Request<int8_t> request(id, value.valueInt8);
+              addRequest(request, 2);
+              break;
+            }
+          case ParamTypeUint16:
+            {
+              crtpParamWriteV2Request<uint16_t> request(id, value.valueUint16);
+              addRequest(request, 2);
+              break;
+            }
+          case ParamTypeInt16:
+            {
+              crtpParamWriteV2Request<int16_t> request(id, value.valueInt16);
+              addRequest(request, 2);
+              break;
+            }
+          case ParamTypeUint32:
+            {
+              crtpParamWriteV2Request<uint32_t> request(id, value.valueUint32);
+              addRequest(request, 2);
+              break;
+            }
+          case ParamTypeInt32:
+            {
+              crtpParamWriteV2Request<int32_t> request(id, value.valueInt32);
+              addRequest(request, 2);
+              break;
+            }
+          case ParamTypeFloat:
+            {
+              crtpParamWriteV2Request<float> request(id, value.valueFloat);
+              addRequest(request, 2);
+              break;
+            }
+        }
       }
     }
   }
@@ -776,29 +1016,31 @@ void Crazyflie::setRequestedParams()
   handleRequests();
 }
 
-void Crazyflie::setParam(uint8_t id, const ParamValue& value)
+void Crazyflie::setParam(uint16_t id, const ParamValue& value)
 {
   startBatchRequest();
   addSetParam(id, value);
   setRequestedParams();
 }
 
-bool Crazyflie::sendPacket(
+bool Crazyflie::sendPacketInternal(
   const uint8_t* data,
-  uint32_t length)
+  uint32_t length,
+  bool useSafeLink)
 {
-  Crazyradio::Ack ack;
-  sendPacket(data, length, ack);
+  ITransport::Ack ack;
+  sendPacketInternal(data, length, ack, useSafeLink);
   return ack.ack;
 }
 
- void Crazyflie::sendPacketOrTimeout(
+ void Crazyflie::sendPacketOrTimeoutInternal(
    const uint8_t* data,
    uint32_t length,
+   bool useSafeLink,
    float timeout)
 {
   auto start = std::chrono::system_clock::now();
-  while (!sendPacket(data, length)) {
+  while (!sendPacketInternal(data, length, useSafeLink)) {
     auto end = std::chrono::system_clock::now();
     std::chrono::duration<double> elapsedSeconds = end-start;
     if (elapsedSeconds.count() > timeout) {
@@ -807,10 +1049,11 @@ bool Crazyflie::sendPacket(
   }
 }
 
-void Crazyflie::sendPacket(
+void Crazyflie::sendPacketInternal(
   const uint8_t* data,
   uint32_t length,
-  Crazyradio::Ack& ack)
+  ITransport::Ack& ack,
+  bool useSafeLink)
 {
   static uint32_t numPackets = 0;
   static uint32_t numAcks = 0;
@@ -828,13 +1071,32 @@ void Crazyflie::sendPacket(
     if (m_radio->getDatarate() != m_datarate) {
       m_radio->setDatarate(m_datarate);
     }
-    if (m_radio->getPower() != m_power) {
-      m_radio->setPower(m_power);
-    }
     if (!m_radio->getAckEnable()) {
       m_radio->setAckEnable(true);
     }
-    m_radio->sendPacket(data, length, ack);
+    if (m_radio->getPower() != m_power) {
+     m_radio->setPower(m_power);
+    }
+    // consider safelink here:
+    //    Adds 1bit counter to CRTP header to guarantee that no ack (downlink)
+    //    payload are lost and no uplink packet are duplicated.
+    //    The caller should resend packet if not acked (ie. same as with a
+    //    direct call to crazyradio.send_packet)
+    if (useSafeLink) {
+      std::vector<uint8_t> dataCopy(data, data + length);
+      dataCopy[0] &= 0xF3;
+      dataCopy[0] |= m_curr_up << 3 | m_curr_down << 2;
+      m_radio->sendPacket(dataCopy.data(), length, ack);
+      if (ack.ack && ack.size > 0 && (ack.data[0] & 0x04) == (m_curr_down << 2)) {
+        m_curr_down = 1 - m_curr_down;
+      }
+      if (ack.ack) {
+        m_curr_up = 1 - m_curr_up;
+      }
+    } else {
+      m_radio->sendPacket(data, length, ack);
+    }
+
   } else {
     std::unique_lock<std::mutex> mlock(g_crazyflieusbMutex[m_devId]);
     m_transport->sendPacket(data, length, ack);
@@ -857,7 +1119,7 @@ void Crazyflie::sendPacket(
 }
 
 void Crazyflie::handleAck(
-  const Crazyradio::Ack& result)
+  const ITransport::Ack& result)
 {
   if (crtpConsoleResponse::match(result)) {
     if (result.size > 0) {
@@ -865,13 +1127,19 @@ void Crazyflie::handleAck(
       if (m_consoleCallback) {
         m_consoleCallback(r->text);
       }
+      // std::cout << "Console CF: " << r->text << std::endl;
     }
-    // ROS_INFO("Console: %s", r->text);
   }
   else if (crtpLogGetInfoResponse::match(result)) {
     // handled in batch system
   }
+  else if (crtpLogGetInfoV2Response::match(result)) {
+    // handled in batch system
+  }
   else if (crtpLogGetItemResponse::match(result)) {
+    // handled in batch system
+  }
+  else if (crtpLogGetItemV2Response::match(result)) {
     // handled in batch system
   }
   else if (crtpLogControlResponse::match(result)) {
@@ -891,6 +1159,15 @@ void Crazyflie::handleAck(
     // handled in batch system
   }
   else if (crtpParamTocGetItemResponse::match(result)) {
+    // handled in batch system
+  }
+  else if (crtpParamTocGetInfoV2Response::match(result)) {
+    // handled in batch system
+  }
+  else if (crtpParamTocGetItemV2Response::match(result)) {
+    // handled in batch system
+  }
+  else if (crtpParamSetByNameResponse::match(result)) {
     // handled in batch system
   }
   else if (crtpMemoryGetNumberResponse::match(result)) {
@@ -914,10 +1191,15 @@ void Crazyflie::handleAck(
   else if (crtp(result.data[0]).port == 8) {
     // handled in batch system
   }
+  else if (crtp(result.data[0]).port == 13) {
+    // handled in batch system
+  }
   else if (crtpPlatformRSSIAck::match(result)) {
-    crtpPlatformRSSIAck* r = (crtpPlatformRSSIAck*)result.data;
-    if (m_emptyAckCallback) {
-      m_emptyAckCallback(r);
+    if (result.size >= 3) {
+      crtpPlatformRSSIAck* r = (crtpPlatformRSSIAck*)result.data;
+      if (m_emptyAckCallback) {
+        m_emptyAckCallback(r);
+      }
     }
   }
   else {
@@ -928,7 +1210,9 @@ void Crazyflie::handleAck(
     // for (size_t i = 1; i < result.size; ++i) {
     //   std::cout << "    " << (int)result.data[i] << std::endl;
     // }
-    queueGenericPacket(result);
+    if (m_genericPacketCallback) {
+      m_genericPacketCallback(result);
+    }
   }
 }
 
@@ -965,12 +1249,14 @@ uint8_t Crazyflie::registerLogBlock(
       return id;
     }
   }
+  return 255;
 }
 
 bool Crazyflie::unregisterLogBlock(
   uint8_t id)
 {
   m_logBlockCb.erase(m_logBlockCb.find(id));
+  return true;
 }
 
 // Batch system
@@ -980,7 +1266,7 @@ void Crazyflie::startBatchRequest()
   m_batchRequests.clear();
 }
 
-void Crazyflie::addRequest(
+void Crazyflie::addRequestInternal(
   const uint8_t* data,
   size_t numBytes,
   size_t numBytesToMatch)
@@ -993,24 +1279,39 @@ void Crazyflie::addRequest(
 }
 
 void Crazyflie::handleRequests(
-  bool throw_timeout,
   bool crtpMode,
+  bool useSafeLink,
   float baseTime,
-  float timePerRequest)
+  float timePerRequest,
+  bool throw_timeout)
 {
   auto start = std::chrono::system_clock::now();
-  Crazyradio::Ack ack;
+  ITransport::Ack ack;
   m_numRequestsFinished = 0;
+  m_numRequestsEnqueued = 0;
   bool sendPing = false;
+  const size_t queueSize = 16;
 
   float timeout = baseTime + timePerRequest * m_batchRequests.size();
 
-  while (true) {
-    if (!crtpMode || !sendPing) {
-      for (const auto& request : m_batchRequests) {
-        if (!request.finished) {
-          // std::cout << "sendReq" << std::endl;
-          sendPacket(request.request.data(), request.request.size(), ack);
+  // Workaround for https://github.com/USC-ACTLab/crazyswarm/issues/172
+  // Disable safelink for now, until packets are really not dropped
+  // anymore.
+  if (false /*useSafeLink*/) {
+
+    const size_t numRequests = m_batchRequests.size();
+    size_t remainingRequests = numRequests;
+    size_t requestIdx = 0;
+
+    while (remainingRequests > 0) {
+      remainingRequests = numRequests - m_numRequestsFinished;
+      // std::cout << "rR: " << remainingRequests << " " << m_numRequestsEnqueued << std::endl;
+      // enqueue up to queue size
+      while(m_numRequestsEnqueued < queueSize && requestIdx < numRequests) {
+        const auto& request = m_batchRequests[requestIdx++];
+
+        do {
+          sendPacketInternal(request.request.data(), request.request.size(), ack, useSafeLink);
           handleBatchAck(ack, crtpMode);
 
           auto end = std::chrono::system_clock::now();
@@ -1019,17 +1320,16 @@ void Crazyflie::handleRequests(
             if(throw_timeout) throw std::runtime_error("timeout");
             else return;
           }
-        }
+          // std::cout << "send req " << requestIdx << std::endl;
+        } while (!ack.ack);
+        m_numRequestsEnqueued++;
       }
-      sendPing = true;
-    } else {
-      for (size_t i = 0; i < 10; ++i) {
-        uint8_t ping = 0xFF;
-        sendPacket(&ping, sizeof(ping), ack);
+      // send ping's until at least one item in queue is done
+      while(m_numRequestsEnqueued == queueSize
+            || (m_numRequestsFinished < numRequests && requestIdx == numRequests)) {
+        crtpEmpty ping;
+        sendPacket(ping, ack, useSafeLink);
         handleBatchAck(ack, crtpMode);
-        // if (ack.ack && crtpPlatformRSSIAck::match(ack)) {
-        //   sendPing = false;
-        // }
 
         auto end = std::chrono::system_clock::now();
         std::chrono::duration<double> elapsedSeconds = end-start;
@@ -1037,18 +1337,57 @@ void Crazyflie::handleRequests(
           if(throw_timeout) throw std::runtime_error("timeout");
           else return;
         }
+        // std::cout << "send ping " << m_numRequestsEnqueued << std::endl;
       }
-
-      sendPing = false;
     }
-    if (m_numRequestsFinished == m_batchRequests.size()) {
-      break;
+  } else {
+    while (true) {
+      if (!crtpMode || !sendPing) {
+        for (const auto& request : m_batchRequests) {
+          if (!request.finished) {
+            // std::cout << "sendReq" << std::endl;
+            sendPacketInternal(request.request.data(), request.request.size(), ack, useSafeLink);
+            handleBatchAck(ack, crtpMode);
+            auto end = std::chrono::system_clock::now();
+            std::chrono::duration<double> elapsedSeconds = end-start;
+            if (elapsedSeconds.count() > timeout) {
+              if(throw_timeout) throw std::runtime_error("timeout");
+              else return;
+            }
+          }
+        }
+        if (m_radio && !useSafeLink) {
+          sendPing = true;
+        }
+      } else {
+        size_t remainingRequests = m_batchRequests.size() - m_numRequestsFinished;
+        for (size_t i = 0; i < remainingRequests; ++i) {
+          crtpEmpty ping;
+          sendPacket(ping, ack, useSafeLink);
+          handleBatchAck(ack, crtpMode);
+          // if (ack.ack && crtpPlatformRSSIAck::match(ack)) {
+          //   sendPing = false;
+          // }
+
+          auto end = std::chrono::system_clock::now();
+          std::chrono::duration<double> elapsedSeconds = end-start;
+          if (elapsedSeconds.count() > timeout) {
+            if(throw_timeout) throw std::runtime_error("timeout");
+            else return;
+          }
+        }
+
+        sendPing = false;
+      }
+      if (m_numRequestsFinished == m_batchRequests.size()) {
+        break;
+      }
     }
   }
 }
 
 void Crazyflie::handleBatchAck(
-  const Crazyradio::Ack& ack,
+  const ITransport::Ack& ack,
   bool crtpMode)
 {
   if (ack.ack) {
@@ -1060,6 +1399,7 @@ void Crazyflie::handleBatchAck(
           request.ack = ack;
           request.finished = true;
           ++m_numRequestsFinished;
+          --m_numRequestsEnqueued;
           // std::cout << "gotack" <<std::endl;
           return;
         }
@@ -1069,6 +1409,7 @@ void Crazyflie::handleBatchAck(
           request.ack = ack;
           request.finished = true;
           ++m_numRequestsFinished;
+          --m_numRequestsEnqueued;
           // std::cout << m_numRequestsFinished / (float)m_batchRequests.size() * 100.0 << " %" << std::endl;
           return;
         }
@@ -1089,25 +1430,25 @@ void Crazyflie::setGroupMask(uint8_t groupMask)
 void Crazyflie::takeoff(float height, float duration, uint8_t groupMask)
 {
   crtpCommanderHighLevelTakeoffRequest req(groupMask, height, duration);
-  sendPacketOrTimeout((uint8_t*)&req, sizeof(req));
+  sendPacketOrTimeout(req);
 }
 
 void Crazyflie::land(float height, float duration, uint8_t groupMask)
 {
   crtpCommanderHighLevelLandRequest req(groupMask, height, duration);
-  sendPacketOrTimeout((uint8_t*)&req, sizeof(req));
+  sendPacketOrTimeout(req);
 }
 
 void Crazyflie::stop(uint8_t groupMask)
 {
   crtpCommanderHighLevelStopRequest req(groupMask);
-  sendPacketOrTimeout((uint8_t*)&req, sizeof(req));
+  sendPacketOrTimeout(req);
 }
 
 void Crazyflie::goTo(float x, float y, float z, float yaw, float duration, bool relative, uint8_t groupMask)
 {
   crtpCommanderHighLevelGoToRequest req(groupMask, relative, x, y, z, yaw, duration);
-  sendPacketOrTimeout((uint8_t*)&req, sizeof(req));
+  sendPacketOrTimeout(req);
 }
 
 void Crazyflie::uploadTrajectory(
@@ -1120,13 +1461,13 @@ void Crazyflie::uploadTrajectory(
       startBatchRequest();
       // upload pieces
       size_t remainingBytes = sizeof(poly4d) * pieces.size();
-      size_t numRequests = ceil(remainingBytes / 24);
+      size_t numRequests = ceil(remainingBytes / 24.0f);
       for (size_t i = 0; i < numRequests; ++i) {
         crtpMemoryWriteRequest req(entry.id, pieceOffset * sizeof(poly4d) + i*24);
         size_t size = std::min<size_t>(remainingBytes, 24);
         memcpy(req.data, reinterpret_cast<const uint8_t*>(pieces.data()) + i * 24, size);
         remainingBytes -= size;
-        addRequest(reinterpret_cast<const uint8_t*>(&req), 6 + size, 5);
+        addRequestInternal(reinterpret_cast<const uint8_t*>(&req), 6 + size, 5);
       }
       // define trajectory
       crtpCommanderHighLevelDefineTrajectoryRequest req(trajectoryId);
@@ -1150,7 +1491,37 @@ void Crazyflie::startTrajectory(
   uint8_t groupMask)
 {
   crtpCommanderHighLevelStartTrajectoryRequest req(groupMask, relative, reversed, trajectoryId, timescale);
-  sendPacketOrTimeout((uint8_t*)&req, sizeof(req));
+  sendPacketOrTimeout(req);
+}
+
+void Crazyflie::readUSDLogFile(
+  std::vector<uint8_t>& data)
+{
+  for (const auto& entry : m_memoryTocEntries) {
+    if (entry.type == MemoryTypeUSD) {
+      startBatchRequest();
+      size_t remainingBytes = entry.size;
+      size_t numRequests = ceil(remainingBytes / 24.0f);
+      for (size_t i = 0; i < numRequests; ++i) {
+        size_t size = std::min<size_t>(remainingBytes, 24);
+        crtpMemoryReadRequest req(entry.id, i*24, size);
+        remainingBytes -= size;
+        addRequest(req, 5);
+      }
+      handleRequests();
+      // put result in data vector
+      data.resize(entry.size);
+      remainingBytes = entry.size;
+      for (size_t i = 0; i < numRequests; ++i) {
+        size_t size = std::min<size_t>(remainingBytes, 24);
+        const crtpMemoryReadResponse* response = getRequestResult<crtpMemoryReadResponse>(i);
+        memcpy(&data[i*24], response->data, size);
+        remainingBytes -= size;
+      }
+      return;
+    }
+  }
+  throw std::runtime_error("Could not find MemoryTypeUSD!");
 }
 
 ////////////////////////////////////////////////////////////////
@@ -1199,6 +1570,7 @@ CrazyflieBroadcaster::CrazyflieBroadcaster(
       std::unique_lock<std::mutex> mlock(g_radioMutex[m_devId]);
       if (!g_crazyradios[m_devId]) {
         g_crazyradios[m_devId] = new Crazyradio(m_devId);
+        g_crazyradios[m_devId]->enableLogging(LOG_COMMUNICATION);
         // g_crazyradios[m_devId]->setAckEnable(false);
         g_crazyradios[m_devId]->setAckEnable(true);
         g_crazyradios[m_devId]->setArc(0);
@@ -1304,32 +1676,42 @@ void CrazyflieBroadcaster::sendExternalPositions(
     requests[j].positions[i%4].y = data[i].y * 1000;
     requests[j].positions[i%4].z = data[i].z * 1000;
   }
+  // 1 header byte per packet; 7 bytes for each position
+  size_t numBytes = requests.size() + data.size() * 7;
 
   size_t remainingRequests = requests.size();
   size_t i = 0;
   while (remainingRequests > 0) {
-    if (remainingRequests >= 2) {
-      send2Packets(reinterpret_cast<const uint8_t*>(&requests[i]), 2 * sizeof(crtpExternalPositionPacked));
+    // the crazyradio requires the two packets to be the same size
+    // -> only send2packets if this is possible
+    if (   remainingRequests >= 2
+        && numBytes >= 2 * sizeof(crtpExternalPositionPacked)) {
+      size_t size = std::min(numBytes, 2 * sizeof(crtpExternalPositionPacked));
+      send2Packets(reinterpret_cast<const uint8_t*>(&requests[i]), size);
       remainingRequests -= 2;
+      numBytes -= size;
       i += 2;
     } else {
-      sendPacket(reinterpret_cast<const uint8_t*>(&requests[i]), sizeof(crtpExternalPositionPacked));
+      size_t size = std::min(numBytes, sizeof(crtpExternalPositionPacked));
+      sendPacket(reinterpret_cast<const uint8_t*>(&requests[i]), size);
       remainingRequests -= 1;
+      numBytes -= size;
       i += 1;
     }
   }
+  // assert(numBytes == 0);
 }
 
-static float const POSITION_LIMIT = 8.0f; // meters
-static const uint32_t INT24_MAX = 8388607;
-static inline posFixed24_t position_float_to_fix24(float x)
+void CrazyflieBroadcaster::emergencyStop()
 {
-  uint32_t val = (INT24_MAX / POSITION_LIMIT) * (x + POSITION_LIMIT);
-  posFixed24_t result;
-  result.low = (val >> 0) & 0xFF;
-  result.middle = (val >> 8) & 0xFF;
-  result.high = (val >> 16) & 0xFF;
-  return result;
+  crtpEmergencyStopRequest req;
+  sendPacket((uint8_t*)&req, sizeof(req));
+}
+
+void CrazyflieBroadcaster::emergencyStopWatchdog()
+{
+  crtpEmergencyStopWatchdogRequest req;
+  sendPacket((uint8_t*)&req, sizeof(req));
 }
 
 // assumes input quaternion is normalized. will fail if not.
@@ -1371,41 +1753,40 @@ void CrazyflieBroadcaster::sendExternalPoses(
     return;
   }
 
-#if 0
-  std::vector<crtpExternalPositionPacked> requests(ceil(data.size() / 4.0));
-  for (size_t i = 0; i < data.size(); ++i) {
-    size_t j = i / 4;
-    requests[j].positions[i%4].id = data[i].id;
-    requests[j].positions[i%4].x = data[i].x * 1000;
-    requests[j].positions[i%4].y = data[i].y * 1000;
-    requests[j].positions[i%4].z = data[i].z * 1000;
-  }
-# else
-  std::vector<crtpPosExtBringup> requests(ceil(data.size() / 2.0));
+  std::vector<crtpExternalPosePacked> requests(ceil(data.size() / 2.0));
   for (size_t i = 0; i < data.size(); ++i) {
     size_t j = i / 2;
-    requests[j].data.pose[i%2].id = data[i].id;
-    requests[j].data.pose[i%2].x = position_float_to_fix24(data[i].x);
-    requests[j].data.pose[i%2].y = position_float_to_fix24(data[i].y);
-    requests[j].data.pose[i%2].z = position_float_to_fix24(data[i].z);
+    requests[j].poses[i%2].id = data[i].id;
+    requests[j].poses[i%2].x = data[i].x * 1000;
+    requests[j].poses[i%2].y = data[i].y * 1000;
+    requests[j].poses[i%2].z = data[i].z * 1000;
     float q[4] = { data[i].qx, data[i].qy, data[i].qz, data[i].qw };
-    requests[j].data.pose[i%2].quat = quatcompress(q);
+    requests[j].poses[i%2].quat = quatcompress(q);
   }
-#endif
+  // 2 header byte per packet; 11 bytes for each position
+  size_t numBytes = requests.size() * 2 + data.size() * 11;
 
   size_t remainingRequests = requests.size();
   size_t i = 0;
   while (remainingRequests > 0) {
-    if (remainingRequests >= 2) {
-      send2Packets(reinterpret_cast<const uint8_t*>(&requests[i]), 2 * sizeof(crtpExternalPositionPacked));
+    // the crazyradio requires the two packets to be the same size
+    // -> only send2packets if this is possible
+    if (   remainingRequests >= 2
+        && numBytes >= 2 * sizeof(crtpExternalPosePacked)) {
+      size_t size = std::min(numBytes, 2 * sizeof(crtpExternalPosePacked));
+      send2Packets(reinterpret_cast<const uint8_t*>(&requests[i]), size);
       remainingRequests -= 2;
+      numBytes -= size;
       i += 2;
     } else {
-      sendPacket(reinterpret_cast<const uint8_t*>(&requests[i]), sizeof(crtpExternalPositionPacked));
+      size_t size = std::min(numBytes, sizeof(crtpExternalPosePacked));
+      sendPacket(reinterpret_cast<const uint8_t*>(&requests[i]), size);
       remainingRequests -= 1;
+      numBytes -= size;
       i += 1;
     }
   }
+  // assert(numBytes == 0);
 }
 
 // void CrazyflieBroadcaster::setParam(

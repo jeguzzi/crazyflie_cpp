@@ -45,6 +45,10 @@ void CrazyflieUSB::sendPacket(
         throw std::runtime_error("No valid device handle!");
     }
 
+    if (m_enableLogging) {
+        logPacket(data, length);
+    }
+
     // Send data
     status = libusb_bulk_transfer(
         m_handle,
@@ -56,7 +60,7 @@ void CrazyflieUSB::sendPacket(
     if (status != LIBUSB_SUCCESS) {
         throw std::runtime_error(libusb_error_name(status));
     }
-    if (length != transferred) {
+    if (length != (uint32_t)transferred) {
         std::stringstream sstr;
         sstr << "Did transfer " << transferred << " but " << length << " was requested!";
         throw std::runtime_error(sstr.str());
@@ -78,6 +82,10 @@ void CrazyflieUSB::sendPacket(
     result.ack = true;
 
     result.size = transferred;
+
+    if (m_enableLogging) {
+        logAck(result);
+    }
 }
 
 void CrazyflieUSB::sendPacketNoAck(
@@ -91,6 +99,10 @@ void CrazyflieUSB::sendPacketNoAck(
         throw std::runtime_error("No valid device handle!");
     }
 
+    if (m_enableLogging) {
+        logPacket(data, length);
+    }
+
     // Send data
     status = libusb_bulk_transfer(
         m_handle,
@@ -102,7 +114,7 @@ void CrazyflieUSB::sendPacketNoAck(
     if (status != LIBUSB_SUCCESS) {
         throw std::runtime_error(libusb_error_name(status));
     }
-    if (length != transferred) {
+    if (length != (uint32_t)transferred) {
         std::stringstream sstr;
         sstr << "Did transfer " << transferred << " but " << length << " was requested!";
         throw std::runtime_error(sstr.str());

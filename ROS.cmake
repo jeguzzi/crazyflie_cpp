@@ -38,12 +38,18 @@ add_library(crazyflie_cpp
   src/CrazyflieUSB.cpp
   src/Crazyflie.cpp
   src/crtp.cpp
+  src/ITransport.cpp
 )
 
 ## Specify libraries to link a library or executable target against
 target_link_libraries(crazyflie_cpp
   ${USB_LIB}
 )
+
+# add_executable(test test/test.cpp)
+# target_link_libraries(test
+#   crazyflie_cpp
+# )
 
 #############
 ## Install ##

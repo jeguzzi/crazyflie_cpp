@@ -67,7 +67,7 @@ void Crazyradio::setAddress(uint64_t address)
     // sendVendorSetup(SET_RADIO_ADDRESS, 0, 0, a, 5);
     // unsigned char a[] = {0xe7, 0xe7, 0xe7, 0xe7, 0x02};
 
-    int status = libusb_control_transfer(
+    /*int status =*/ libusb_control_transfer(
         m_handle,
         LIBUSB_REQUEST_TYPE_VENDOR,
         SET_RADIO_ADDRESS,
@@ -150,6 +150,10 @@ void Crazyradio::sendPacket(
         throw std::runtime_error("No valid device handle!");
     }
 
+    if (m_enableLogging) {
+        logPacket(data, length);
+    }
+
     // Send data
     status = libusb_bulk_transfer(
         m_handle,
@@ -157,14 +161,14 @@ void Crazyradio::sendPacket(
         (uint8_t*)data,
         length,
         &transferred,
-        /*timeout*/ 1000);
-    if (status == LIBUSB_ERROR_TIMEOUT) {
-        return;
-    }
+        /*timeout*/ 100);
+    // if (status == LIBUSB_ERROR_TIMEOUT) {
+    //     return;
+    // }
     if (status != LIBUSB_SUCCESS) {
         throw std::runtime_error(libusb_error_name(status));
     }
-    if (length != transferred) {
+    if (length != (uint32_t)transferred) {
         std::stringstream sstr;
         sstr << "Did transfer " << transferred << " but " << length << " was requested!";
         throw std::runtime_error(sstr.str());
@@ -177,7 +181,7 @@ void Crazyradio::sendPacket(
         (unsigned char*)&result,
         sizeof(result) - 1,
         &transferred,
-        /*timeout*/ 1000);
+        /*timeout*/ 10);
     if (status == LIBUSB_ERROR_TIMEOUT) {
         return;
     }
@@ -186,6 +190,10 @@ void Crazyradio::sendPacket(
     }
 
     result.size = transferred - 1;
+
+    if (m_enableLogging) {
+        logAck(result);
+    }
 }
 
 void Crazyradio::sendPacketNoAck(
@@ -199,6 +207,10 @@ void Crazyradio::sendPacketNoAck(
         throw std::runtime_error("No valid device handle!");
     }
 
+    if (m_enableLogging) {
+        logPacket(data, length);
+    }
+
     // Send data
     status = libusb_bulk_transfer(
         m_handle,
@@ -206,14 +218,14 @@ void Crazyradio::sendPacketNoAck(
         (uint8_t*)data,
         length,
         &transferred,
-        /*timeout*/ 1000);
-    if (status == LIBUSB_ERROR_TIMEOUT) {
-        return;
-    }
+        /*timeout*/ 100);
+    // if (status == LIBUSB_ERROR_TIMEOUT) {
+    //     return;
+    // }
     if (status != LIBUSB_SUCCESS) {
         throw std::runtime_error(libusb_error_name(status));
     }
-    if (length != transferred) {
+    if (length != (uint32_t)transferred) {
         std::stringstream sstr;
         sstr << "Did transfer " << transferred << " but " << length << " was requested!";
         throw std::runtime_error(sstr.str());
@@ -231,6 +243,10 @@ void Crazyradio::send2PacketsNoAck(
         throw std::runtime_error("No valid device handle!");
     }
 
+    if (m_enableLogging) {
+        logPacket(data, totalLength);
+    }
+
     // Send data
     status = libusb_bulk_transfer(
         m_handle,
@@ -238,14 +254,14 @@ void Crazyradio::send2PacketsNoAck(
         (uint8_t*)data,
         totalLength,
         &transferred,
-        /*timeout*/ 1000);
-    if (status == LIBUSB_ERROR_TIMEOUT) {
-        return;
-    }
+        /*timeout*/ 100);
+    // if (status == LIBUSB_ERROR_TIMEOUT) {
+    //     return;
+    // }
     if (status != LIBUSB_SUCCESS) {
         throw std::runtime_error(libusb_error_name(status));
     }
-    if (totalLength != transferred) {
+    if (totalLength != (uint32_t)transferred) {
         std::stringstream sstr;
         sstr << "Did transfer " << transferred << " but " << totalLength << " was requested!";
         throw std::runtime_error(sstr.str());
